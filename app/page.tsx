@@ -17,7 +17,6 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { format } from "date-fns"
 import { cn } from "@/lib/utils"
 import { CalendarIcon } from "lucide-react"
-import { sql } from '@vercel/postgres';
 
 interface Shop {
   id: string
@@ -102,56 +101,26 @@ export default function CoconutFlowerManagement() {
   const [transactionEndDate, setTransactionEndDate] = useState<Date | undefined>(undefined)
 
   useEffect(() => {
-    const loadData = async () => {
-      try {
-        const { rows: data } = await sql`
-          SELECT * FROM app_data WHERE id = 'main_data'
-        `;
-        
-        if (data.length > 0) {
-          const savedData = JSON.parse(data[0].data);
-          setShops(savedData.shops || []);
-          setTransactions(savedData.transactions || []);
-          setFarmMovements(savedData.farmMovements || []);
-          setAvailableStock(savedData.availableStock || 0);
-          setGodownStock(savedData.godownStock || 0);
-        }
-      } catch (error) {
-        // If table doesn't exist, create it
-        await sql`
-          CREATE TABLE IF NOT EXISTS app_data (
-            id TEXT PRIMARY KEY,
-            data JSONB
-          )
-        `;
-      }
-    };
+    const savedShops = localStorage.getItem("shops")
+    const savedTransactions = localStorage.getItem("transactions")
+    const savedFarmMovements = localStorage.getItem("farmMovements")
+    const savedStock = localStorage.getItem("availableStock")
+    const savedGodownStock = localStorage.getItem("godownStock")
 
-    loadData();
-    const interval = setInterval(loadData, 5000); // Poll every 5 seconds
-    
-    return () => clearInterval(interval);
-  }, []);
+    if (savedShops) setShops(JSON.parse(savedShops))
+    if (savedTransactions) setTransactions(JSON.parse(savedTransactions))
+    if (savedFarmMovements) setFarmMovements(JSON.parse(savedFarmMovements))
+    if (savedStock) setAvailableStock(JSON.parse(savedStock))
+    if (savedGodownStock) setGodownStock(JSON.parse(savedGodownStock))
+  }, [])
 
   useEffect(() => {
-    const saveData = async () => {
-      const data = {
-        shops,
-        transactions,
-        farmMovements,
-        availableStock,
-        godownStock
-      };
-
-      await sql`
-        INSERT INTO app_data (id, data)
-        VALUES ('main_data', ${JSON.stringify(data)})
-        ON CONFLICT (id) DO UPDATE SET data = ${JSON.stringify(data)}
-      `;
-    };
-
-    saveData();
-  }, [shops, transactions, farmMovements, availableStock, godownStock]);
+    localStorage.setItem("shops", JSON.stringify(shops))
+    localStorage.setItem("transactions", JSON.stringify(transactions))
+    localStorage.setItem("farmMovements", JSON.stringify(farmMovements))
+    localStorage.setItem("availableStock", JSON.stringify(availableStock))
+    localStorage.setItem("godownStock", JSON.stringify(godownStock))
+  }, [shops, transactions, farmMovements, availableStock, godownStock])
 
   const addShop = () => {
     if (newShop.name.trim() && newShop.owner.trim() && newShop.phone.trim() && newShop.address.trim()) {
