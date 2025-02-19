@@ -10,10 +10,14 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { DatePicker } from "@/components/ui/date-picker"
 import { Calendar } from "@/components/ui/calendar"
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from "recharts"
 import * as XLSX from "xlsx"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { format } from "date-fns"
+import { cn } from "@/lib/utils"
+import { CalendarIcon } from "lucide-react"
+import { sql } from '@vercel/postgres';
 
 interface Shop {
   id: string
@@ -41,6 +45,13 @@ interface FarmMovement {
   flowersAdded: number
   date: string
   type: "godown" | "available"
+}
+
+interface StockMovement {
+  id: string;
+  type: 'godown' | 'available';
+  quantity: number;
+  date: string;
 }
 
 export default function CoconutFlowerManagement() {
@@ -82,28 +93,65 @@ export default function CoconutFlowerManagement() {
   const [farmMovementDate, setFarmMovementDate] = useState<Date>(new Date())
   const [farmMovementType, setFarmMovementType] = useState<"godown" | "available">("godown")
   const [trendChartPeriod, setTrendChartPeriod] = useState<"month" | "7days" | "30days" | "all">("month")
+  const [historyStartDate, setHistoryStartDate] = useState<Date | undefined>(undefined)
+  const [historyEndDate, setHistoryEndDate] = useState<Date | undefined>(undefined)
+  const [stockMovements, setStockMovements] = useState<StockMovement[]>([])
+  const [stockStartDate, setStockStartDate] = useState<Date | undefined>(undefined)
+  const [stockEndDate, setStockEndDate] = useState<Date | undefined>(undefined)
+  const [transactionStartDate, setTransactionStartDate] = useState<Date | undefined>(undefined)
+  const [transactionEndDate, setTransactionEndDate] = useState<Date | undefined>(undefined)
 
   useEffect(() => {
-    const savedShops = localStorage.getItem("shops")
-    const savedTransactions = localStorage.getItem("transactions")
-    const savedFarmMovements = localStorage.getItem("farmMovements")
-    const savedStock = localStorage.getItem("availableStock")
-    const savedGodownStock = localStorage.getItem("godownStock")
+    const loadData = async () => {
+      try {
+        const { rows: data } = await sql`
+          SELECT * FROM app_data WHERE id = 'main_data'
+        `;
+        
+        if (data.length > 0) {
+          const savedData = JSON.parse(data[0].data);
+          setShops(savedData.shops || []);
+          setTransactions(savedData.transactions || []);
+          setFarmMovements(savedData.farmMovements || []);
+          setAvailableStock(savedData.availableStock || 0);
+          setGodownStock(savedData.godownStock || 0);
+        }
+      } catch (error) {
+        // If table doesn't exist, create it
+        await sql`
+          CREATE TABLE IF NOT EXISTS app_data (
+            id TEXT PRIMARY KEY,
+            data JSONB
+          )
+        `;
+      }
+    };
 
-    if (savedShops) setShops(JSON.parse(savedShops))
-    if (savedTransactions) setTransactions(JSON.parse(savedTransactions))
-    if (savedFarmMovements) setFarmMovements(JSON.parse(savedFarmMovements))
-    if (savedStock) setAvailableStock(JSON.parse(savedStock))
-    if (savedGodownStock) setGodownStock(JSON.parse(savedGodownStock))
-  }, [])
+    loadData();
+    const interval = setInterval(loadData, 5000); // Poll every 5 seconds
+    
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
-    localStorage.setItem("shops", JSON.stringify(shops))
-    localStorage.setItem("transactions", JSON.stringify(transactions))
-    localStorage.setItem("farmMovements", JSON.stringify(farmMovements))
-    localStorage.setItem("availableStock", JSON.stringify(availableStock))
-    localStorage.setItem("godownStock", JSON.stringify(godownStock))
-  }, [shops, transactions, farmMovements, availableStock, godownStock])
+    const saveData = async () => {
+      const data = {
+        shops,
+        transactions,
+        farmMovements,
+        availableStock,
+        godownStock
+      };
+
+      await sql`
+        INSERT INTO app_data (id, data)
+        VALUES ('main_data', ${JSON.stringify(data)})
+        ON CONFLICT (id) DO UPDATE SET data = ${JSON.stringify(data)}
+      `;
+    };
+
+    saveData();
+  }, [shops, transactions, farmMovements, availableStock, godownStock]);
 
   const addShop = () => {
     if (newShop.name.trim() && newShop.owner.trim() && newShop.phone.trim() && newShop.address.trim()) {
@@ -161,17 +209,19 @@ export default function CoconutFlowerManagement() {
   const addFlowersFromFarm = () => {
     if (flowersFromFarm) {
       const flowersAdded = Number.parseInt(flowersFromFarm)
-      const newMovement: FarmMovement = {
+      const movement: StockMovement = {
         id: Date.now().toString(),
-        flowersAdded,
-        date: farmMovementDate.toISOString(),
         type: farmMovementType,
+        quantity: flowersAdded,
+        date: farmMovementDate.toISOString()
       }
 
-      setFarmMovements(
-        [...farmMovements, newMovement].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
+      const updatedMovements = [...stockMovements, movement].sort(
+        (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
       )
-      if (farmMovementType === "available") {
+      setStockMovements(updatedMovements)
+      
+      if (farmMovementType === 'available') {
         setAvailableStock(availableStock + flowersAdded)
         setGodownStock(godownStock - flowersAdded)
       } else {
@@ -276,10 +326,19 @@ export default function CoconutFlowerManagement() {
     .sort((a, b) => a.name.localeCompare(b.name))
 
   const generateReceipt = () => {
-    if (!selectedShop) return
+    if (!selectedShop) return;
 
-    const lastTransaction = getLastDeliveryDetails(selectedShop.id)
-    const currentBalance = getShopBalance(selectedShop.id)
+    const shopTransactions = getShopTransactions(selectedShop.id)
+      .filter(t => new Date(t.date) < saleDate)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    const lastDelivery = shopTransactions.length > 0 ? shopTransactions[0] : null;
+    const previousBalance = shopTransactions.length > 0 ? 
+      shopTransactions[0].outstandingBalance : 0;
+
+    const newBalance = previousBalance + 
+      (Number.parseInt(flowersSold) * Number.parseFloat(rate)) - 
+      Number.parseFloat(cashReceived);
 
     const receiptContent = `
 Coconut Flower
@@ -287,49 +346,77 @@ Phone: 9943676453
 ------------------------
 Shop: ${selectedShop.name}
 Date: ${saleDate.toLocaleDateString()}
-Last Delivery: ${lastTransaction ? `${lastTransaction.date} - ${lastTransaction.flowersSold} flowers at ₹${lastTransaction.rate}` : "N/A"}
+${lastDelivery ? `Last Delivery: ${new Date(lastDelivery.date).toLocaleDateString()} - ${lastDelivery.flowersSold} flowers at ₹${lastDelivery.rate}` : ''}
 Flowers Sold: ${flowersSold}
 Rate: ₹${rate}
 Total Amount: ₹${(Number.parseInt(flowersSold) * Number.parseFloat(rate)).toFixed(2)}
 Cash Received: ₹${cashReceived}
-Previous Balance: ₹${currentBalance.toFixed(2)}
-New Balance: ₹${(currentBalance + Number.parseInt(flowersSold) * Number.parseFloat(rate) - Number.parseFloat(cashReceived)).toFixed(2)}
+${shopTransactions.length > 0 ? `Previous Balance: ₹${previousBalance.toFixed(2)}` : ''}
+New Balance: ₹${newBalance.toFixed(2)}
 ------------------------
 Thank you for your business!
-    `
+    `;
 
-    const blob = new Blob([receiptContent], { type: "text/plain" })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement("a")
-    link.href = url
-    link.download = `receipt_${selectedShop.name}_${saleDate.toISOString().split("T")[0]}.txt`
-    link.click()
-    URL.revokeObjectURL(url)
-  }
+    // Add copy to clipboard button
+    const textArea = document.createElement('textarea');
+    textArea.value = receiptContent;
+    document.body.appendChild(textArea);
+    textArea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textArea);
+
+    // Also provide download option
+    const blob = new Blob([receiptContent], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `receipt_${selectedShop.name}_${saleDate.toISOString().split('T')[0]}.txt`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   const updateTransaction = () => {
     if (editingTransaction) {
-      const updatedTransactions = transactions.map((t) => {
-        if (t.id === editingTransaction.id) {
-          return editingTransaction
+      const updatedTransactions = [...transactions]
+      
+      // Remove the editing transaction first
+      const withoutEditing = updatedTransactions.filter(t => t.id !== editingTransaction.id)
+      
+      // Add back the edited transaction
+      withoutEditing.push(editingTransaction)
+      
+      // Sort all transactions by date
+      const sortedTransactions = withoutEditing.sort(
+        (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
+      )
+
+      // Recalculate all balances by shop
+      const shopGroups = groupBy(sortedTransactions, 'shopId')
+      
+      const recalculatedTransactions = sortedTransactions.map(t => {
+        const shopTransactions = shopGroups[t.shopId]
+          .filter(st => new Date(st.date) <= new Date(t.date))
+          .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+        
+        const balance = shopTransactions.reduce((sum, curr) => 
+          sum + (curr.flowersSold * curr.rate - curr.cashReceived), 0)
+        
+        return {
+          ...t,
+          outstandingBalance: balance
         }
-        return t
       })
 
-      // Recalculate outstanding balances for all transactions of this shop
-      const shopTransactions = updatedTransactions
-        .filter((t) => t.shopId === editingTransaction.shopId)
-        .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-
-      let runningBalance = 0
-      shopTransactions.forEach((t) => {
-        runningBalance += t.flowersSold * t.rate - t.cashReceived
-        t.outstandingBalance = runningBalance
-      })
-
-      setTransactions(updatedTransactions)
+      setTransactions(recalculatedTransactions)
       setEditingTransaction(null)
     }
+  }
+
+  const groupBy = (array: any[], key: string) => {
+    return array.reduce((result, currentValue) => {
+      (result[currentValue[key]] = result[currentValue[key]] || []).push(currentValue)
+      return result
+    }, {})
   }
 
   const getShopDeliveryTrends = (shopId: string) => {
@@ -352,22 +439,22 @@ Thank you for your business!
         break
       case "all":
       default:
-        startDate = new Date(0) // Beginning of time
+        startDate = new Date(0)
     }
 
-    return shopTransactions
+    const filteredTransactions = shopTransactions
       .filter((t) => new Date(t.date) >= startDate && new Date(t.date) <= endDate)
-      .map((t) => ({
+      
+    let cumulative = 0
+    return filteredTransactions.map((t) => {
+      cumulative += t.flowersSold
+      return {
         date: new Date(t.date).toLocaleDateString(),
         flowersSold: t.flowersSold,
-      }))
-  }
-
-  const exportData = (data: any[], fileName: string) => {
-    const ws = XLSX.utils.json_to_sheet(data)
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, "Sheet1")
-    XLSX.writeFile(wb, `${fileName}.xlsx`)
+        cumulativeQuantity: cumulative,
+        amount: t.flowersSold * t.rate
+      }
+    })
   }
 
   const sortedTransactions = useMemo(() => {
@@ -394,9 +481,122 @@ Thank you for your business!
     setSortConfig({ key, direction })
   }
 
+  const generateReceiptForTransaction = (transaction: Transaction) => {
+    const shop = shops.find(s => s.id === transaction.shopId)
+    if (!shop) return
+
+    const shopTransactions = getShopTransactions(shop.id)
+      .filter(t => new Date(t.date) < new Date(transaction.date))
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+
+    const lastDelivery = shopTransactions.length > 0 ? shopTransactions[0] : null
+    const previousBalance = shopTransactions.length > 0 ? 
+      shopTransactions[0].outstandingBalance : 0
+
+    const receiptContent = `
+Coconut Flower
+Phone: 9943676453
+------------------------
+Shop: ${shop.name}
+Date: ${new Date(transaction.date).toLocaleDateString()}
+${lastDelivery ? `Last Delivery: ${new Date(lastDelivery.date).toLocaleDateString()} - ${lastDelivery.flowersSold} flowers at ₹${lastDelivery.rate}` : ''}
+Flowers Sold: ${transaction.flowersSold}
+Rate: ₹${transaction.rate}
+Total Amount: ₹${(transaction.flowersSold * transaction.rate).toFixed(2)}
+Cash Received: ₹${transaction.cashReceived}
+${shopTransactions.length > 0 ? `Previous Balance: ₹${previousBalance.toFixed(2)}` : ''}
+New Balance: ₹${transaction.outstandingBalance.toFixed(2)}
+------------------------
+Thank you for your business!
+    `
+
+    // Copy to clipboard
+    const textArea = document.createElement('textarea')
+    textArea.value = receiptContent
+    document.body.appendChild(textArea)
+    textArea.select()
+    document.execCommand('copy')
+    document.body.removeChild(textArea)
+
+    // Download
+    const blob = new Blob([receiptContent], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `receipt_${shop.name}_${transaction.date.split('T')[0]}.txt`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const getFilteredTransactions = (transactions: Transaction[], period: string, dateRange?: { from: Date | undefined; to: Date | undefined }) => {
+    if (dateRange?.from || dateRange?.to) {
+      return transactions.filter(t => {
+        const transactionDate = new Date(t.date)
+        return (!dateRange.from || transactionDate >= dateRange.from) &&
+               (!dateRange.to || transactionDate <= dateRange.to)
+      })
+    }
+
+    const endDate = new Date()
+    let startDate = new Date()
+
+    switch (period) {
+      case "7days":
+        startDate.setDate(endDate.getDate() - 7)
+        break
+      case "30days":
+        startDate.setDate(endDate.getDate() - 30)
+        break
+      case "month":
+        startDate.setMonth(endDate.getMonth() - 1)
+        break
+      case "all":
+        return transactions
+    }
+
+    return transactions.filter(t => {
+      const transactionDate = new Date(t.date)
+      return transactionDate >= startDate && transactionDate <= endDate
+    })
+  }
+
+  const getFilteredAndSortedTransactions = (
+    transactions: Transaction[], 
+    date?: Date,
+    startDate?: Date,
+    endDate?: Date,
+    shopId?: string
+  ) => {
+    return transactions
+      .filter(t => {
+        const transactionDate = new Date(t.date)
+        const matchesDate = !date || transactionDate.toDateString() === date.toDateString()
+        const matchesDateRange = (!startDate || transactionDate >= startDate) && 
+                               (!endDate || transactionDate <= endDate)
+        const matchesShop = !shopId || t.shopId === shopId
+        
+        return matchesDate && matchesDateRange && matchesShop
+      })
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+  }
+
+  const getTransactionSummary = (transactions: Transaction[]) => {
+    return {
+      totalFlowers: transactions.reduce((sum, t) => sum + t.flowersSold, 0),
+      totalAmount: transactions.reduce((sum, t) => sum + (t.flowersSold * t.rate), 0),
+      totalReceived: transactions.reduce((sum, t) => sum + t.cashReceived, 0),
+      averageRate: transactions.length > 0 
+        ? transactions.reduce((sum, t) => sum + t.rate, 0) / transactions.length 
+        : 0,
+      totalOutstanding: transactions.length > 0 
+        ? transactions[transactions.length - 1].outstandingBalance 
+        : 0
+    }
+  }
+
   return (
     <div className="container mx-auto p-4">
-      <h1 className="text-2xl font-bold mb-4">Coconut Flower Management</h1>
+      <h1 className="text-2xl font-bold mb-4">CocoFlower</h1>
 
       <Tabs defaultValue="dashboard" className="space-y-4">
         <TabsList className="flex justify-start overflow-x-auto">
@@ -408,59 +608,130 @@ Thank you for your business!
         </TabsList>
 
         <TabsContent value="dashboard">
-          <Card>
-            <CardHeader>
-              <CardTitle>Dashboard</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="grid gap-4">
-                <div>
-                  <h3 className="text-lg font-semibold mb-2">Available Stock</h3>
-                  <p className="text-3xl font-bold">{availableStock} flowers</p>
-                </div>
-                <div>
-                  <h3 className="text-lg font-semibold mb-2">Godown Stock</h3>
-                  <p className="text-3xl font-bold">{godownStock} flowers</p>
-                </div>
-                <div>
-                  <h3 className="text-lg font-semibold mb-2">Total Outstanding</h3>
-                  <p className="text-3xl font-bold">₹{getTotalOutstanding().toFixed(2)}</p>
-                </div>
-                <div>
-                  <h3 className="text-lg font-semibold mb-2">Shops with Outstanding Balance</h3>
-                  <ul>
-                    {getShopsWithOutstanding().map((shop) => (
-                      <li key={shop.id}>
-                        {shop.name}: ₹{getShopBalance(shop.id).toFixed(2)}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-                <div>
-                  <h3 className="text-lg font-semibold mb-2">Summary</h3>
-                  <div className="grid grid-cols-3 gap-4">
-                    {["day", "week", "month"].map((period) => {
-                      const summary = getSummary(period as "day" | "week" | "month")
-                      return (
-                        <Card key={period}>
-                          <CardHeader>
-                            <CardTitle className="capitalize">{period}</CardTitle>
-                          </CardHeader>
-                          <CardContent>
-                            <p>Total Sold: {summary.totalSold}</p>
-                            <p>Total Amount: ₹{summary.totalAmount.toFixed(2)}</p>
-                            <p>Total Received: ₹{summary.totalReceived.toFixed(2)}</p>
-                            <p>Balance: ₹{summary.balance.toFixed(2)}</p>
-                            <p>Average Price: ₹{summary.averagePrice.toFixed(2)}</p>
-                          </CardContent>
-                        </Card>
-                      )
-                    })}
+          <div className="grid gap-4">
+            {/* Summary Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              <Card>
+                <CardContent className="pt-6">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-sm font-medium text-muted-foreground">Stock in Hand</p>
+                    <div className="flex items-center gap-2">
+                      <Flower className="h-4 w-4 text-primary" />
+                      <h2 className="text-2xl font-bold">{availableStock}</h2>
+                    </div>
                   </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="pt-6">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-sm font-medium text-muted-foreground">Total Stock in Godown</p>
+                    <div className="flex items-center gap-2">
+                      <Flower className="h-4 w-4 text-primary" />
+                      <h2 className="text-2xl font-bold">{godownStock}</h2>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="pt-6">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-sm font-medium text-muted-foreground">Total Outstanding</p>
+                    <div className="flex items-center gap-2">
+                      <span className="text-primary">₹</span>
+                      <h2 className="text-2xl font-bold">{getTotalOutstanding().toFixed(2)}</h2>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardContent className="pt-6">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-sm font-medium text-muted-foreground">Today's Sales</p>
+                    <div className="flex items-center gap-2">
+                      <Flower className="h-4 w-4 text-primary" />
+                      <h2 className="text-2xl font-bold">
+                        {transactions
+                          .filter(t => new Date(t.date).toDateString() === new Date().toDateString())
+                          .reduce((sum, t) => sum + t.flowersSold, 0)}
+                      </h2>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* Shops with Outstanding */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Shops with Outstanding Balance</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Shop</TableHead>
+                        <TableHead>Outstanding (₹)</TableHead>
+                        <TableHead>Last Transaction</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {getShopsWithOutstanding().map((shop) => {
+                        const lastTransaction = transactions
+                          .filter(t => t.shopId === shop.id)
+                          .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())[0];
+                        return (
+                          <TableRow key={shop.id}>
+                            <TableCell className="font-medium">{shop.name}</TableCell>
+                            <TableCell>₹{getShopBalance(shop.id).toFixed(2)}</TableCell>
+                            <TableCell>{lastTransaction ? new Date(lastTransaction.date).toLocaleDateString() : '-'}</TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
                 </div>
-              </div>
-            </CardContent>
-          </Card>
+              </CardContent>
+            </Card>
+
+            {/* Period Summary Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {["day", "week", "month"].map((period) => {
+                const summary = getSummary(period as "day" | "week" | "month")
+                return (
+                  <Card key={period}>
+                    <CardHeader>
+                      <CardTitle className="capitalize">{period} Summary</CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="space-y-2">
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Total Sold:</span>
+                          <span className="font-medium">{summary.totalSold}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Total Amount:</span>
+                          <span className="font-medium">₹{summary.totalAmount.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Total Received:</span>
+                          <span className="font-medium">₹{summary.totalReceived.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Average Price:</span>
+                          <span className="font-medium">₹{summary.averagePrice.toFixed(2)}</span>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                )
+              })}
+            </div>
+          </div>
         </TabsContent>
 
         <TabsContent value="sales">
@@ -500,76 +771,104 @@ Thank you for your business!
                   </Select>
                 </div>
                 {selectedShop && (
-                  <Card className="p-4 relative">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="absolute top-2 right-2"
-                      onClick={() => setEditingShop(selectedShop)}
-                    >
-                      <Edit className="h-4 w-4" />
-                    </Button>
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <p className="font-semibold">Shop Name:</p>
-                        <p>{selectedShop.name}</p>
+                  <Card className="bg-gradient-to-r from-slate-50 to-slate-100">
+                    <CardContent className="pt-6 relative">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="absolute top-2 right-2"
+                        onClick={() => setEditingShop(selectedShop)}
+                      >
+                        <Edit className="h-4 w-4" />
+                      </Button>
+                      <div className="border-b pb-4 mb-4">
+                        <h2 className="text-2xl font-bold text-left text-slate-800">{selectedShop.name}</h2>
                       </div>
-                      <div>
-                        <p className="font-semibold">Owner:</p>
-                        <p>{selectedShop.owner}</p>
-                      </div>
-                      <div>
-                        <p className="font-semibold">Phone:</p>
-                        <p>
-                          <a href={`tel:${selectedShop.phone}`}>{selectedShop.phone}</a>
-                        </p>
-                      </div>
-                      <div>
-                        <p className="font-semibold">Address:</p>
-                        <p>{selectedShop.address}</p>
-                      </div>
-                      {selectedShop.alternateNumbers.map((number, index) => (
-                        <div key={index}>
-                          <p className="font-semibold">{number.name}:</p>
-                          <p>
-                            <a href={`tel:${number.number}`}>{number.number}</a>
-                          </p>
+                      <div className="grid gap-4 text-slate-600">
+                        <div className="flex flex-col sm:flex-row sm:justify-between gap-2">
+                          <div className="flex gap-2">
+                            <span className="font-semibold min-w-[4rem]">Owner:</span>
+                            <span>{selectedShop.owner}</span>
+                          </div>
+                          <div className="flex gap-2">
+                            <span className="font-semibold">Phone:</span>
+                            <span><a href={`tel:${selectedShop.phone}`}>{selectedShop.phone}</a></span>
+                          </div>
                         </div>
-                      ))}
-                      {selectedShop.location && (
-                        <div className="col-span-2">
-                          <Button
-                            variant="link"
-                            onClick={() =>
-                              window.open(
-                                `https://www.google.com/maps/search/?api=1&query=${selectedShop.location}`,
-                                "_blank",
-                              )
-                            }
-                          >
-                            <MapPin className="mr-2 h-4 w-4" />
-                            View Location
-                          </Button>
+                        {selectedShop.alternateNumbers.map((number, index) => (
+                          <div key={index} className="flex gap-2">
+                            <span className="font-semibold min-w-[4rem]">{number.name}:</span>
+                            <span><a href={`tel:${number.number}`}>{number.number}</a></span>
+                          </div>
+                        ))}
+                        <div className="flex gap-2">
+                          <span className="font-semibold min-w-[4rem]">Address:</span>
+                          <span>{selectedShop.address}</span>
                         </div>
-                      )}
-                    </div>
-                    <div className="mt-4">
-                      <p className="font-semibold">Current Balance:</p>
-                      <p>₹{getShopBalance(selectedShop.id).toFixed(2)}</p>
-                    </div>
-                    {getLastDeliveryDetails(selectedShop.id) && (
-                      <div className="mt-4">
-                        <p className="font-semibold">Last Delivery:</p>
-                        <p>Date: {getLastDeliveryDetails(selectedShop.id)?.date}</p>
-                        <p>Flowers Sold: {getLastDeliveryDetails(selectedShop.id)?.flowersSold}</p>
-                        <p>Rate: ₹{getLastDeliveryDetails(selectedShop.id)?.rate}</p>
+                        {selectedShop.location && (
+                          <div className="flex gap-2">
+                            <Button
+                              variant="link"
+                              className="p-0 h-auto font-normal"
+                              onClick={() =>
+                                window.open(
+                                  `https://www.google.com/maps/search/?api=1&query=${selectedShop.location}`,
+                                  "_blank",
+                                )
+                              }
+                            >
+                              <MapPin className="mr-2 h-4 w-4" />
+                              View Location
+                            </Button>
+                          </div>
+                        )}
+                        <div className="border-t pt-4 mt-2">
+                          <div className="flex gap-2">
+                            <span className="font-semibold min-w-[4rem]">Balance:</span>
+                            <span>₹{getShopBalance(selectedShop.id).toFixed(2)}</span>
+                          </div>
+                          {getLastDeliveryDetails(selectedShop.id) && (
+                            <div className="mt-2">
+                              <div className="font-semibold mb-1">Last Delivery:</div>
+                              <div className="grid gap-1 pl-4">
+                                <div>Date: {getLastDeliveryDetails(selectedShop.id)?.date}</div>
+                                <div>Flowers: {getLastDeliveryDetails(selectedShop.id)?.flowersSold}</div>
+                                <div>Rate: ₹{getLastDeliveryDetails(selectedShop.id)?.rate}</div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    )}
+                    </CardContent>
                   </Card>
                 )}
                 <div className="grid w-full max-w-sm items-center gap-1.5">
                   <Label htmlFor="saleDate">Sale Date</Label>
-                  <DatePicker date={saleDate} setDate={setSaleDate} />
+                  <Popover>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant={"outline"}
+                        className={cn(
+                          "w-[240px] justify-start text-left font-normal",
+                          !saleDate && "text-muted-foreground"
+                        )}
+                      >
+                        {saleDate ? (
+                          format(saleDate, "PPP")
+                        ) : (
+                          <span>Pick a date</span>
+                        )}
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-auto p-0" align="start">
+                      <Calendar
+                        mode="single"
+                        selected={saleDate}
+                        onSelect={(date) => date && setSaleDate(date)}
+                        initialFocus
+                      />
+                    </PopoverContent>
+                  </Popover>
                 </div>
                 <div className="grid w-full max-w-sm items-center gap-1.5">
                   <Label htmlFor="flowersSold">Flowers Sold</Label>
@@ -638,11 +937,11 @@ Thank you for your business!
             <CardContent>
               <div className="grid gap-4">
                 <div>
-                  <h3 className="text-lg font-semibold mb-2">Godown Stock</h3>
+                  <h3 className="text-lg font-semibold mb-2">Total Stock in Godown</h3>
                   <p className="text-3xl font-bold">{godownStock} flowers</p>
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold mb-2">Available Stock</h3>
+                  <h3 className="text-lg font-semibold mb-2">Stock in Hand</h3>
                   <p className="text-3xl font-bold">{availableStock} flowers</p>
                 </div>
                 <div className="grid w-full max-w-sm items-center gap-1.5">
@@ -652,28 +951,243 @@ Thank you for your business!
                     id="flowersFromFarm"
                     value={flowersFromFarm}
                     onChange={(e) => setFlowersFromFarm(e.target.value)}
-                    placeholder="Enter number of flowers"
+                    placeholder="Number of flowers"
                   />
                 </div>
                 <div className="grid w-full max-w-sm items-center gap-1.5">
                   <Label htmlFor="farmMovementDate">Date</Label>
-                  <DatePicker date={farmMovementDate} setDate={setFarmMovementDate} />
+                  <Popover>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant={"outline"}
+                        className={cn(
+                          "w-[240px] justify-start text-left font-normal",
+                          !farmMovementDate && "text-muted-foreground"
+                        )}
+                      >
+                        {farmMovementDate ? (
+                          format(farmMovementDate, "PPP")
+                        ) : (
+                          <span>Pick a date</span>
+                        )}
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-auto p-0" align="start">
+                      <Calendar
+                        mode="single"
+                        selected={farmMovementDate}
+                        onSelect={(date) => date && setFarmMovementDate(date)}
+                        initialFocus
+                      />
+                    </PopoverContent>
+                  </Popover>
                 </div>
-                <div className="grid w-full max-w-sm items-center gap-1.5">
-                  <Label htmlFor="farmMovementType">Add to</Label>
-                  <Select onValueChange={(value: "godown" | "available") => setFarmMovementType(value)}>
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select stock type" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="godown">Godown Stock</SelectItem>
-                      <SelectItem value="available">Available Stock</SelectItem>
-                    </SelectContent>
-                  </Select>
+                <div className="flex gap-2">
+                  <Button 
+                    onClick={() => {
+                      setFarmMovementType("godown")
+                      addFlowersFromFarm()
+                    }}
+                  >
+                    <Flower className="mr-2 h-4 w-4" /> Add to Godown Stock
+                  </Button>
+                  <Button 
+                    onClick={() => {
+                      setFarmMovementType("available")
+                      addFlowersFromFarm()
+                    }}
+                  >
+                    <Flower className="mr-2 h-4 w-4" /> Add to Stock in Hand
+                  </Button>
                 </div>
-                <Button onClick={addFlowersFromFarm}>
-                  <Flower className="mr-2 h-4 w-4" /> Add to Stock
-                </Button>
+                <div className="mt-8">
+                  <h3 className="text-lg font-semibold mb-4">Stock Movement History</h3>
+                  <div className="grid gap-2 mb-4">
+                    <div className="flex gap-2">
+                      <div className="grid gap-2">
+                        <Label>Start Date</Label>
+                        <Popover>
+                          <PopoverTrigger asChild>
+                            <Button
+                              variant={"outline"}
+                              className={cn(
+                                "w-[240px] justify-start text-left font-normal",
+                                !stockStartDate && "text-muted-foreground"
+                              )}
+                            >
+                              {stockStartDate ? (
+                                format(stockStartDate, "PPP")
+                              ) : (
+                                <span>Pick a date</span>
+                              )}
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-auto p-0" align="start">
+                            <Calendar
+                              mode="single"
+                              selected={stockStartDate}
+                              onSelect={setStockStartDate}
+                              initialFocus
+                            />
+                          </PopoverContent>
+                        </Popover>
+                      </div>
+
+                      <div className="grid gap-2">
+                        <Label>End Date</Label>
+                        <Popover>
+                          <PopoverTrigger asChild>
+                            <Button
+                              variant={"outline"}
+                              className={cn(
+                                "w-[240px] justify-start text-left font-normal",
+                                !stockEndDate && "text-muted-foreground"
+                              )}
+                            >
+                              {stockEndDate ? (
+                                format(stockEndDate, "PPP")
+                              ) : (
+                                <span>Pick a date</span>
+                              )}
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-auto p-0" align="start">
+                            <Calendar
+                              mode="single"
+                              selected={stockEndDate}
+                              onSelect={setStockEndDate}
+                              initialFocus
+                            />
+                          </PopoverContent>
+                        </Popover>
+                      </div>
+
+                      <div className="grid gap-2">
+                        <Label>&nbsp;</Label>
+                        <Button 
+                          variant="outline"
+                          onClick={() => {
+                            setStockStartDate(undefined)
+                            setStockEndDate(undefined)
+                          }}
+                        >
+                          Reset Dates
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Date</TableHead>
+                        <TableHead>Type</TableHead>
+                        <TableHead>Quantity</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {stockMovements
+                        .filter((m) => {
+                          const movementDate = new Date(m.date)
+                          return (!stockStartDate || movementDate >= stockStartDate) &&
+                                 (!stockEndDate || movementDate <= stockEndDate)
+                        })
+                        .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+                        .map((movement) => (
+                          <TableRow key={movement.id}>
+                            <TableCell>{new Date(movement.date).toLocaleDateString()}</TableCell>
+                            <TableCell>{movement.type === 'godown' ? 'Total Stock in Godown' : 'Stock in Hand'}</TableCell>
+                            <TableCell>{movement.quantity}</TableCell>
+                          </TableRow>
+                        ))}
+                    </TableBody>
+                  </Table>
+
+                  <Button 
+                    onClick={() => {
+                      const filteredMovements = stockMovements
+                        .filter((m) => {
+                          const movementDate = new Date(m.date)
+                          return (!stockStartDate || movementDate >= stockStartDate) &&
+                                 (!stockEndDate || movementDate <= stockEndDate)
+                        })
+                        .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+                      const printWindow = window.open('', '', 'height=500,width=800');
+                      if (printWindow) {
+                        printWindow.document.write(`
+                          <html>
+                            <head>
+                              <title>Stock Movement History</title>
+                              <style>
+                                body { font-family: Arial, sans-serif; padding: 20px; }
+                                table { 
+                                  width: 100%; 
+                                  border-collapse: collapse; 
+                                  margin-bottom: 20px;
+                                }
+                                th, td { 
+                                  border: 1px solid black; 
+                                  padding: 8px; 
+                                  text-align: left; 
+                                }
+                                th { 
+                                  background-color: #f0f0f0; 
+                                  font-weight: bold;
+                                }
+                                .summary { margin-bottom: 20px; }
+                                @media print {
+                                  button { display: none; }
+                                  @page { margin: 2cm; }
+                                }
+                              </style>
+                            </head>
+                            <body>
+                              <h2>Stock Movement History</h2>
+                              ${stockStartDate ? `<p>From: ${stockStartDate.toLocaleDateString()}</p>` : ''}
+                              ${stockEndDate ? `<p>To: ${stockEndDate.toLocaleDateString()}</p>` : ''}
+                              <div class="summary">
+                                <h3>Summary</h3>
+                                <p>Total Movements: ${filteredMovements.length}</p>
+                                <p>Total Added to Godown: ${filteredMovements
+                                  .filter(m => m.type === 'godown')
+                                  .reduce((sum, m) => sum + m.quantity, 0)}</p>
+                                <p>Total Added to Stock in Hand: ${filteredMovements
+                                  .filter(m => m.type === 'available')
+                                  .reduce((sum, m) => sum + m.quantity, 0)}</p>
+                              </div>
+                              <table>
+                                <thead>
+                                  <tr>
+                                    <th>Date</th>
+                                    <th>Type</th>
+                                    <th>Quantity</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  ${filteredMovements.map(m => `
+                                    <tr>
+                                      <td>${new Date(m.date).toLocaleDateString()}</td>
+                                      <td>${m.type === 'godown' ? 'Total Stock in Godown' : 'Stock in Hand'}</td>
+                                      <td>${m.quantity}</td>
+                                    </tr>
+                                  `).join('')}
+                                </tbody>
+                              </table>
+                            </body>
+                          </html>
+                        `);
+                        printWindow.document.close();
+                        printWindow.focus();
+                        printWindow.print();
+                        printWindow.close();
+                      }
+                    }}
+                  >
+                    <Download className="mr-2 h-4 w-4" />
+                    Print History
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -681,44 +1195,120 @@ Thank you for your business!
 
         <TabsContent value="shops">
           <Card>
-            <CardHeader>
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-4">
               <CardTitle>Manage Shops</CardTitle>
+              <div className="w-[240px]">
+                <Select
+                  value={shopSearch || "all"}
+                  onValueChange={(value) => setShopSearch(value === "all" ? "" : value)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select Shop" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <Input
+                      placeholder="Search shops..."
+                      value={shopSearch}
+                      onChange={(e) => setShopSearch(e.target.value)}
+                      className="mb-2"
+                    />
+                    <SelectItem value="all">All Shops</SelectItem>
+                    {shops
+                      .sort((a, b) => a.name.localeCompare(b.name))
+                      .map((shop) => (
+                        <SelectItem key={shop.id} value={shop.name}>
+                          {shop.name}
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </CardHeader>
             <CardContent>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 {shops
+                  .filter(shop => 
+                    !shopSearch || 
+                    shop.name.toLowerCase().includes(shopSearch.toLowerCase()) ||
+                    shop.owner.toLowerCase().includes(shopSearch.toLowerCase())
+                  )
                   .sort((a, b) => a.name.localeCompare(b.name))
                   .map((shop) => (
-                    <Card key={shop.id} className="p-4 relative">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="absolute top-2 right-2"
-                        onClick={() => setEditingShop(shop)}
-                      >
-                        <Edit className="h-4 w-4" />
-                      </Button>
-                      <div className="grid gap-2">
-                        <div>
-                          <p className="font-semibold">Shop Name:</p>
-                          <p>{shop.name}</p>
+                    <Card key={shop.id} className="bg-gradient-to-r from-slate-50 to-slate-100">
+                      <CardContent className="pt-6 relative">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="absolute top-2 right-2"
+                          onClick={() => setEditingShop(shop)}
+                        >
+                          <Edit className="h-4 w-4" />
+                        </Button>
+                        <div className="border-b pb-4 mb-4">
+                          <h2 className="text-2xl font-bold text-left text-slate-800">{shop.name}</h2>
                         </div>
-                        <div>
-                          <p className="font-semibold">Owner:</p>
-                          <p>{shop.owner}</p>
+                        <div className="grid gap-4 text-slate-600">
+                          <div className="flex flex-col sm:flex-row sm:justify-between gap-2">
+                            <div className="flex gap-2">
+                              <span className="font-semibold min-w-[4rem]">Owner:</span>
+                              <span>{shop.owner}</span>
+                            </div>
+                            <div className="flex gap-2">
+                              <span className="font-semibold">Phone:</span>
+                              <span><a href={`tel:${shop.phone}`}>{shop.phone}</a></span>
+                            </div>
+                          </div>
+                          {shop.alternateNumbers.map((number, index) => (
+                            <div key={index} className="flex gap-2">
+                              <span className="font-semibold min-w-[4rem]">{number.name}:</span>
+                              <span><a href={`tel:${number.number}`}>{number.number}</a></span>
+                            </div>
+                          ))}
+                          <div className="flex gap-2">
+                            <span className="font-semibold min-w-[4rem]">Address:</span>
+                            <span>{shop.address}</span>
+                          </div>
+                          {shop.location && (
+                            <div className="flex gap-2">
+                              <Button
+                                variant="link"
+                                className="p-0 h-auto font-normal"
+                                onClick={() =>
+                                  window.open(
+                                    `https://www.google.com/maps/search/?api=1&query=${shop.location}`,
+                                    "_blank",
+                                  )
+                                }
+                              >
+                                <MapPin className="mr-2 h-4 w-4" />
+                                View Location
+                              </Button>
+                            </div>
+                          )}
+                          <div className="border-t pt-4 mt-2">
+                            <div className="flex gap-2">
+                              <span className="font-semibold min-w-[4rem]">Balance:</span>
+                              <span>₹{getShopBalance(shop.id).toFixed(2)}</span>
+                            </div>
+                            {getLastDeliveryDetails(shop.id) && (
+                              <div className="mt-2">
+                                <div className="font-semibold mb-1">Last Delivery:</div>
+                                <div className="grid gap-1 pl-4">
+                                  <div>Date: {getLastDeliveryDetails(shop.id)?.date}</div>
+                                  <div>Flowers: {getLastDeliveryDetails(shop.id)?.flowersSold}</div>
+                                  <div>Rate: ₹{getLastDeliveryDetails(shop.id)?.rate}</div>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                          <Button 
+                            className="mt-2"
+                            onClick={() => setSelectedShopForHistory(shop)}
+                          >
+                            View Details
+                          </Button>
                         </div>
-                        <div>
-                          <p className="font-semibold">Phone:</p>
-                          <p>
-                            <a href={`tel:${shop.phone}`}>{shop.phone}</a>
-                          </p>
-                        </div>
-                        <div>
-                          <p className="font-semibold">Address:</p>
-                          <p>{shop.address}</p>
-                        </div>
-                        <Button onClick={() => setSelectedShopForHistory(shop)}>View Details</Button>
-                      </div>
+                      </CardContent>
                     </Card>
                   ))}
               </div>
@@ -729,156 +1319,192 @@ Thank you for your business!
         <TabsContent value="history">
           <Card>
             <CardHeader>
-              <CardTitle>History</CardTitle>
+              <CardTitle>Transaction History</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="grid gap-4">
-                <Calendar
-                  mode="single"
-                  selected={selectedDate}
-                  onSelect={setSelectedDate}
-                  className="rounded-md border"
-                />
-                {selectedDate && (
-                  <div>
-                    <h3 className="text-lg font-semibold mb-2">Transactions on {selectedDate.toLocaleDateString()}</h3>
+                <div className="flex flex-wrap gap-4">
+                  <div className="grid gap-2">
+                    <Label>Start Date</Label>
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button
+                          variant={"outline"}
+                          className={cn(
+                            "w-[240px] justify-start text-left font-normal",
+                            !transactionStartDate && "text-muted-foreground"
+                          )}
+                        >
+                          <CalendarIcon className="mr-2 h-4 w-4" />
+                          {transactionStartDate ? format(transactionStartDate, "PPP") : <span>Pick a date</span>}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0" align="start">
+                        <Calendar
+                          mode="single"
+                          selected={transactionStartDate}
+                          onSelect={setTransactionStartDate}
+                          initialFocus
+                        />
+                      </PopoverContent>
+                    </Popover>
+                  </div>
+
+                  <div className="grid gap-2">
+                    <Label>End Date</Label>
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button
+                          variant={"outline"}
+                          className={cn(
+                            "w-[240px] justify-start text-left font-normal",
+                            !transactionEndDate && "text-muted-foreground"
+                          )}
+                        >
+                          <CalendarIcon className="mr-2 h-4 w-4" />
+                          {transactionEndDate ? format(transactionEndDate, "PPP") : <span>Pick a date</span>}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0" align="start">
+                        <Calendar
+                          mode="single"
+                          selected={transactionEndDate}
+                          onSelect={setTransactionEndDate}
+                          initialFocus
+                        />
+                      </PopoverContent>
+                    </Popover>
+                  </div>
+
+                  <div className="grid gap-2">
+                    <Label>Shop</Label>
+                    <div className="flex gap-2">
+                      <Select
+                        value={historyFilter.shop || "all"}
+                        onValueChange={(value) => setHistoryFilter({ ...historyFilter, shop: value === "all" ? "" : value })}
+                      >
+                        <SelectTrigger className="w-[240px]">
+                          <SelectValue placeholder="All Shops" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <Input
+                            placeholder="Search shops..."
+                            value={shopSearch}
+                            onChange={(e) => setShopSearch(e.target.value)}
+                            className="mb-2"
+                          />
+                          <SelectItem value="all">All Shops</SelectItem>
+                          {shops
+                            .filter(shop => 
+                              shop.name.toLowerCase().includes(shopSearch.toLowerCase()) ||
+                              shop.owner.toLowerCase().includes(shopSearch.toLowerCase())
+                            )
+                            .sort((a, b) => a.name.localeCompare(b.name))
+                            .map((shop) => (
+                              <SelectItem key={shop.id} value={shop.id}>
+                                {shop.name}
+                              </SelectItem>
+                            ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-2">
+                    <Label>&nbsp;</Label>
+                    <div className="flex gap-2">
+                      <Button 
+                        variant="outline"
+                        onClick={() => {
+                          setTransactionStartDate(undefined);
+                          setTransactionEndDate(undefined);
+                          setHistoryFilter({ ...historyFilter, shop: "" });
+                          setShopSearch("");
+                        }}
+                      >
+                        Reset All Filters
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                  <Card>
+                    <CardContent className="pt-6">
+                      <div className="text-2xl font-bold">
+                        {getFilteredTransactions(transactions, trendChartPeriod, { from: transactionStartDate, to: transactionEndDate })
+                          .filter(t => !historyFilter.shop || t.shopId === historyFilter.shop)
+                          .reduce((sum, t) => sum + t.flowersSold, 0)}
+                      </div>
+                      <p className="text-muted-foreground">Total Flowers Sold</p>
+                    </CardContent>
+                  </Card>
+                  <Card>
+                    <CardContent className="pt-6">
+                      <div className="text-2xl font-bold">₹{
+                        getFilteredTransactions(transactions, trendChartPeriod, { from: transactionStartDate, to: transactionEndDate })
+                          .filter(t => !historyFilter.shop || t.shopId === historyFilter.shop)
+                          .reduce((sum, t) => sum + (t.flowersSold * t.rate), 0).toFixed(2)
+                      }</div>
+                      <p className="text-muted-foreground">Total Amount</p>
+                    </CardContent>
+                  </Card>
+                  <Card>
+                    <CardContent className="pt-6">
+                      <div className="text-2xl font-bold">₹{
+                        getFilteredTransactions(transactions, trendChartPeriod, { from: transactionStartDate, to: transactionEndDate })
+                          .filter(t => !historyFilter.shop || t.shopId === historyFilter.shop)
+                          .reduce((sum, t) => sum + t.cashReceived, 0).toFixed(2)
+                      }</div>
+                      <p className="text-muted-foreground">Total Received</p>
+                    </CardContent>
+                  </Card>
+                </div>
+
+                <div className="overflow-x-auto -mx-4 sm:mx-0">
+                  <div className="inline-block min-w-full align-middle">
                     <Table>
                       <TableHeader>
                         <TableRow>
-                          <TableHead className="cursor-pointer" onClick={() => requestSort("shopId")}>
-                            Shop {sortConfig?.key === "shopId" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                          </TableHead>
-                          <TableHead className="cursor-pointer" onClick={() => requestSort("flowersSold")}>
-                            Flowers Sold{" "}
-                            {sortConfig?.key === "flowersSold" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                          </TableHead>
-                          <TableHead className="cursor-pointer" onClick={() => requestSort("rate")}>
-                            Rate (₹) {sortConfig?.key === "rate" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                          </TableHead>
-                          <TableHead className="cursor-pointer" onClick={() => requestSort("cashReceived")}>
-                            Received (₹){" "}
-                            {sortConfig?.key === "cashReceived" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                          </TableHead>
-                          <TableHead>Actions</TableHead>
+                          <TableHead>Date</TableHead>
+                          <TableHead>Flowers Sold</TableHead>
+                          <TableHead>Rate (₹)</TableHead>
+                          <TableHead>Total (₹)</TableHead>
+                          <TableHead>Received (₹)</TableHead>
+                          <TableHead>Outstanding (₹)</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {sortedTransactions
-                          .filter((t) => new Date(t.date).toDateString() === selectedDate.toDateString())
+                        {getFilteredTransactions(transactions, trendChartPeriod, { from: transactionStartDate, to: transactionEndDate })
+                          .filter(t => !historyFilter.shop || t.shopId === historyFilter.shop)
+                          .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
                           .map((transaction) => {
                             const shop = shops.find((s) => s.id === transaction.shopId)
                             return (
                               <TableRow key={transaction.id}>
-                                <TableCell>{shop?.name}</TableCell>
+                                <TableCell>{new Date(transaction.date).toLocaleDateString()}</TableCell>
                                 <TableCell>{transaction.flowersSold}</TableCell>
                                 <TableCell>{transaction.rate.toFixed(2)}</TableCell>
+                                <TableCell>{(transaction.flowersSold * transaction.rate).toFixed(2)}</TableCell>
                                 <TableCell>{transaction.cashReceived.toFixed(2)}</TableCell>
-                                <TableCell>
-                                  <Button onClick={() => setEditingTransaction(transaction)}>
-                                    <Edit className="h-4 w-4" />
-                                  </Button>
-                                </TableCell>
+                                <TableCell>{transaction.outstandingBalance.toFixed(2)}</TableCell>
                               </TableRow>
                             )
                           })}
                       </TableBody>
                     </Table>
                   </div>
-                )}
-                <div>
-                  <h3 className="text-lg font-semibold mb-2">All Transactions</h3>
-                  <div className="grid gap-2 mb-4">
-                    <Input
-                      placeholder="Filter by shop name"
-                      value={historyFilter.shop}
-                      onChange={(e) => setHistoryFilter({ ...historyFilter, shop: e.target.value })}
-                    />
-                    <div className="flex gap-2">
-                      <Input
-                        placeholder="Min rate"
-                        type="number"
-                        value={historyFilter.minRate}
-                        onChange={(e) => setHistoryFilter({ ...historyFilter, minRate: e.target.value })}
-                      />
-                      <Input
-                        placeholder="Max rate"
-                        type="number"
-                        value={historyFilter.maxRate}
-                        onChange={(e) => setHistoryFilter({ ...historyFilter, maxRate: e.target.value })}
-                      />
-                    </div>
-                    <div className="flex gap-2">
-                      <Input
-                        placeholder="Min outstanding"
-                        type="number"
-                        value={historyFilter.minOutstanding}
-                        onChange={(e) => setHistoryFilter({ ...historyFilter, minOutstanding: e.target.value })}
-                      />
-                      <Input
-                        placeholder="Max outstanding"
-                        type="number"
-                        value={historyFilter.maxOutstanding}
-                        onChange={(e) => setHistoryFilter({ ...historyFilter, maxOutstanding: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="cursor-pointer" onClick={() => requestSort("date")}>
-                          Date {sortConfig?.key === "date" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                        </TableHead>
-                        <TableHead className="cursor-pointer" onClick={() => requestSort("shopId")}>
-                          Shop {sortConfig?.key === "shopId" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                        </TableHead>
-                        <TableHead className="cursor-pointer" onClick={() => requestSort("flowersSold")}>
-                          Flowers Sold{" "}
-                          {sortConfig?.key === "flowersSold" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                        </TableHead>
-                        <TableHead className="cursor-pointer" onClick={() => requestSort("rate")}>
-                          Rate (₹) {sortConfig?.key === "rate" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                        </TableHead>
-                        <TableHead className="cursor-pointer" onClick={() => requestSort("cashReceived")}>
-                          Received (₹){" "}
-                          {sortConfig?.key === "cashReceived" && (sortConfig.direction === "ascending" ? "↑" : "↓")}
-                        </TableHead>
-                        <TableHead>Outstanding (₹)</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {sortedTransactions
-                        .filter((t) => {
-                          const shop = shops.find((s) => s.id === t.shopId)
-                          return (
-                            (!historyFilter.shop ||
-                              (shop && shop.name.toLowerCase().includes(historyFilter.shop.toLowerCase()))) &&
-                            (!historyFilter.minRate || t.rate >= Number.parseFloat(historyFilter.minRate)) &&
-                            (!historyFilter.maxRate || t.rate <= Number.parseFloat(historyFilter.maxRate)) &&
-                            (!historyFilter.minOutstanding ||
-                              t.outstandingBalance >= Number.parseFloat(historyFilter.minOutstanding)) &&
-                            (!historyFilter.maxOutstanding ||
-                              t.outstandingBalance <= Number.parseFloat(historyFilter.maxOutstanding))
-                          )
-                        })
-                        .map((transaction) => {
-                          const shop = shops.find((s) => s.id === transaction.shopId)
-                          return (
-                            <TableRow key={transaction.id}>
-                              <TableCell>{new Date(transaction.date).toLocaleDateString()}</TableCell>
-                              <TableCell>{shop?.name}</TableCell>
-                              <TableCell>{transaction.flowersSold}</TableCell>
-                              <TableCell>{transaction.rate.toFixed(2)}</TableCell>
-                              <TableCell>{transaction.cashReceived.toFixed(2)}</TableCell>
-                              <TableCell>{transaction.outstandingBalance.toFixed(2)}</TableCell>
-                            </TableRow>
-                          )
-                        })}
-                    </TableBody>
-                  </Table>
                 </div>
-                <Button onClick={() => exportData(sortedTransactions, "transaction_history")}>
-                  <Download className="mr-2 h-4 w-4" />
-                  Export Data
+
+                <Button 
+                  variant="outline"
+                  onClick={() => {
+                    setHistoryFilter({ ...historyFilter, shop: "" });
+                    setTransactionStartDate(undefined);
+                    setTransactionEndDate(undefined);
+                  }}
+                >
+                  Reset Filters
                 </Button>
               </div>
             </CardContent>
@@ -887,9 +1513,12 @@ Thank you for your business!
       </Tabs>
 
       <Dialog open={showAddShopDialog} onOpenChange={setShowAddShopDialog}>
-        <DialogContent>
+        <DialogContent aria-describedby="add-shop-dialog-description">
           <DialogHeader>
             <DialogTitle>Add New Shop</DialogTitle>
+            <p id="add-shop-dialog-description" className="text-sm text-muted-foreground">
+              Enter the details of the new shop to add it to your list.
+            </p>
           </DialogHeader>
           <div className="grid gap-4 py-4">
             <div className="grid grid-cols-4 items-center gap-4">
@@ -997,9 +1626,12 @@ Thank you for your business!
 
       {editingShop && (
         <Dialog open={!!editingShop} onOpenChange={() => setEditingShop(null)}>
-          <DialogContent>
+          <DialogContent aria-describedby="edit-shop-dialog-description">
             <DialogHeader>
               <DialogTitle>Edit Shop</DialogTitle>
+              <p id="edit-shop-dialog-description" className="text-sm text-muted-foreground">
+                Update the shop's information.
+              </p>
             </DialogHeader>
             <div className="grid gap-4 py-4">
               <div className="grid grid-cols-4 items-center gap-4">
@@ -1120,9 +1752,12 @@ Thank you for your business!
 
       {editingTransaction && (
         <Dialog open={!!editingTransaction} onOpenChange={() => setEditingTransaction(null)}>
-          <DialogContent>
+          <DialogContent aria-describedby="edit-transaction-dialog-description">
             <DialogHeader>
               <DialogTitle>Edit Transaction</DialogTitle>
+              <p id="edit-transaction-dialog-description" className="text-sm text-muted-foreground">
+                Modify the transaction details.
+              </p>
             </DialogHeader>
             <div className="grid gap-4 py-4">
               <div className="grid grid-cols-4 items-center gap-4">
@@ -1173,62 +1808,162 @@ Thank you for your business!
       )}
 
       <Dialog open={showReceiptDialog} onOpenChange={setShowReceiptDialog}>
-        <DialogContent>
+        <DialogContent className="sm:max-w-[425px]" aria-describedby="receipt-dialog-description">
           <DialogHeader>
-            <DialogTitle>Generate Receipt</DialogTitle>
+            <DialogTitle>Receipt Options</DialogTitle>
+            <p id="receipt-dialog-description" className="text-sm text-muted-foreground">
+              Choose how you would like to receive the receipt.
+            </p>
           </DialogHeader>
-          <p>Do you want to generate and download the receipt?</p>
-          <DialogFooter>
-            <Button onClick={() => setShowReceiptDialog(false)}>Cancel</Button>
+          <div className="flex flex-col gap-4">
             <Button
               onClick={() => {
-                generateReceipt()
-                setShowReceiptDialog(false)
-                setFlowersSold("")
-                setRate("")
-                setCashReceived("")
-                setReplacedFlowers("")
-                setSelectedShop(null)
-                setSaleDate(new Date())
+                const receipt = generateReceipt();
+                if (receipt) {
+                  navigator.clipboard.writeText(receipt);
+                  toast({
+                    title: "Copied to clipboard",
+                    description: "Receipt has been copied to clipboard"
+                  });
+                }
               }}
             >
-              Generate Receipt
+              Copy to Clipboard
             </Button>
-          </DialogFooter>
+            <Button
+              onClick={() => {
+                const receipt = generateReceipt();
+                if (receipt) {
+                  const blob = new Blob([receipt], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const link = document.createElement('a');
+                  link.href = url;
+                  link.download = `receipt_${selectedShop?.name}_${saleDate.toISOString().split('T')[0]}.txt`;
+                  link.click();
+                  URL.revokeObjectURL(url);
+                }
+              }}
+            >
+              Download Text File
+            </Button>
+            <Button variant="outline" onClick={() => setShowReceiptDialog(false)}>
+              Cancel
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
 
       {selectedShopForHistory && (
         <Dialog open={!!selectedShopForHistory} onOpenChange={() => setSelectedShopForHistory(null)}>
-          <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+          <DialogContent 
+            className="max-w-4xl max-h-[80vh] overflow-y-auto" 
+            aria-describedby="shop-details-dialog-description"
+          >
             <DialogHeader>
-              <DialogTitle>{selectedShopForHistory.name} - Transaction History</DialogTitle>
+              <p id="shop-details-dialog-description" className="text-sm text-muted-foreground">
+                View detailed information and transaction history for this shop.
+              </p>
             </DialogHeader>
-            <div className="grid gap-4 py-4">
-              <div className="flex justify-between items-center">
-                <h3 className="text-lg font-semibold">Trend Chart</h3>
-                <Select onValueChange={(value: "month" | "7days" | "30days" | "all") => setTrendChartPeriod(value)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select period" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="month">Last Month</SelectItem>
-                    <SelectItem value="7days">Last 7 Days</SelectItem>
-                    <SelectItem value="30days">Last 30 Days</SelectItem>
-                    <SelectItem value="all">All Time</SelectItem>
-                  </SelectContent>
-                </Select>
+            <div className="grid gap-4 py-4" id="printableShopDetails">
+              <Card className="bg-gradient-to-r from-slate-50 to-slate-100">
+                <CardContent className="pt-6">
+                  <div className="border-b pb-4 mb-4">
+                    <h2 className="text-2xl font-bold text-left text-slate-800">{selectedShopForHistory.name}</h2>
+                  </div>
+                  <div className="grid gap-4 text-slate-600">
+                    <div className="flex flex-col sm:flex-row sm:justify-between gap-2">
+                      <div className="flex gap-2">
+                        <span className="font-semibold min-w-[4rem]">Owner:</span>
+                        <span>{selectedShopForHistory.owner}</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <span className="font-semibold">Phone:</span>
+                        <span>{selectedShopForHistory.phone}</span>
+                      </div>
+                    </div>
+                    {selectedShopForHistory.alternateNumbers.map((number, index) => (
+                      <div key={index} className="flex gap-2">
+                        <span className="font-semibold min-w-[4rem]">{number.name}:</span>
+                        <span>{number.number}</span>
+                      </div>
+                    ))}
+                    <div className="flex gap-2">
+                      <span className="font-semibold min-w-[4rem]">Address:</span>
+                      <span>{selectedShopForHistory.address}</span>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <div className="flex justify-between items-center gap-4">
+                <h3 className="text-lg font-semibold">Transaction History</h3>
+                <div className="flex gap-4">
+                  <div className="grid gap-2">
+                    <Label>Start Date</Label>
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button
+                          variant={"outline"}
+                          className={cn(
+                            "w-[240px] justify-start text-left font-normal",
+                            !transactionStartDate && "text-muted-foreground"
+                          )}
+                        >
+                          <CalendarIcon className="mr-2 h-4 w-4" />
+                          {transactionStartDate ? format(transactionStartDate, "PPP") : <span>Pick a date</span>}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0" align="start">
+                        <Calendar
+                          mode="single"
+                          selected={transactionStartDate}
+                          onSelect={setTransactionStartDate}
+                          initialFocus
+                        />
+                      </PopoverContent>
+                    </Popover>
+                  </div>
+
+                  <div className="grid gap-2">
+                    <Label>End Date</Label>
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button
+                          variant={"outline"}
+                          className={cn(
+                            "w-[240px] justify-start text-left font-normal",
+                            !transactionEndDate && "text-muted-foreground"
+                          )}
+                        >
+                          <CalendarIcon className="mr-2 h-4 w-4" />
+                          {transactionEndDate ? format(transactionEndDate, "PPP") : <span>Pick a date</span>}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0" align="start">
+                        <Calendar
+                          mode="single"
+                          selected={transactionEndDate}
+                          onSelect={setTransactionEndDate}
+                          initialFocus
+                        />
+                      </PopoverContent>
+                    </Popover>
+                  </div>
+
+                  <div className="grid gap-2">
+                    <Label>&nbsp;</Label>
+                    <Button 
+                      variant="outline"
+                      onClick={() => {
+                        setTransactionStartDate(undefined);
+                        setTransactionEndDate(undefined);
+                      }}
+                    >
+                      Reset Dates
+                    </Button>
+                  </div>
+                </div>
               </div>
-              <ResponsiveContainer width="100%" height={300}>
-                <LineChart data={getShopDeliveryTrends(selectedShopForHistory.id)}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="date" />
-                  <YAxis />
-                  <Tooltip />
-                  <Legend />
-                  <Line type="monotone" dataKey="flowersSold" stroke="#8884d8" />
-                </LineChart>
-              </ResponsiveContainer>
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -1241,42 +1976,123 @@ Thank you for your business!
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {getShopTransactions(selectedShopForHistory.id).map((transaction) => (
-                    <TableRow key={transaction.id}>
-                      <TableCell>{new Date(transaction.date).toLocaleDateString()}</TableCell>
-                      <TableCell>{transaction.flowersSold}</TableCell>
-                      <TableCell>{transaction.rate.toFixed(2)}</TableCell>
-                      <TableCell>{(transaction.flowersSold * transaction.rate).toFixed(2)}</TableCell>
-                      <TableCell>{transaction.cashReceived.toFixed(2)}</TableCell>
-                      <TableCell>{transaction.outstandingBalance.toFixed(2)}</TableCell>
-                    </TableRow>
-                  ))}
+                  {getShopTransactions(selectedShopForHistory.id)
+                    .filter(t => {
+                      const transactionDate = new Date(t.date);
+                      return (!transactionStartDate || transactionDate >= transactionStartDate) &&
+                             (!transactionEndDate || transactionDate <= transactionEndDate);
+                    })
+                    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+                    .map((transaction) => (
+                      <TableRow key={transaction.id}>
+                        <TableCell>{new Date(transaction.date).toLocaleDateString()}</TableCell>
+                        <TableCell>{transaction.flowersSold}</TableCell>
+                        <TableCell>{transaction.rate.toFixed(2)}</TableCell>
+                        <TableCell>{(transaction.flowersSold * transaction.rate).toFixed(2)}</TableCell>
+                        <TableCell>{transaction.cashReceived.toFixed(2)}</TableCell>
+                        <TableCell>{transaction.outstandingBalance.toFixed(2)}</TableCell>
+                      </TableRow>
+                    ))}
                 </TableBody>
               </Table>
-              <div>
-                <p>
-                  Total Flowers Sold:{" "}
-                  {getShopTransactions(selectedShopForHistory.id).reduce((sum, t) => sum + t.flowersSold, 0)}
-                </p>
-                <p>
-                  Average Rate: ₹
-                  {(
-                    getShopTransactions(selectedShopForHistory.id).reduce((sum, t) => sum + t.rate, 0) /
-                    getShopTransactions(selectedShopForHistory.id).length
-                  ).toFixed(2)}
-                </p>
-                <p>Total Outstanding: ₹{getShopBalance(selectedShopForHistory.id).toFixed(2)}</p>
+              <div className="grid gap-4">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Description</TableHead>
+                      <TableHead>Value</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {(() => {
+                      const filteredTransactions = getShopTransactions(selectedShopForHistory.id)
+                        .filter(t => {
+                          const transactionDate = new Date(t.date);
+                          return (!transactionStartDate || transactionDate >= transactionStartDate) &&
+                                 (!transactionEndDate || transactionDate <= transactionEndDate);
+                        });
+                      
+                      return (
+                        <>
+                          <TableRow>
+                            <TableCell>Total Flowers Sold</TableCell>
+                            <TableCell>{filteredTransactions.reduce((sum, t) => sum + t.flowersSold, 0)}</TableCell>
+                          </TableRow>
+                          <TableRow>
+                            <TableCell>Total Amount</TableCell>
+                            <TableCell>₹{filteredTransactions
+                              .reduce((sum, t) => sum + (t.flowersSold * t.rate), 0).toFixed(2)}</TableCell>
+                          </TableRow>
+                          <TableRow>
+                            <TableCell>Total Received</TableCell>
+                            <TableCell>₹{filteredTransactions
+                              .reduce((sum, t) => sum + t.cashReceived, 0).toFixed(2)}</TableCell>
+                          </TableRow>
+                          <TableRow>
+                            <TableCell>Current Outstanding</TableCell>
+                            <TableCell>₹{getShopBalance(selectedShopForHistory.id).toFixed(2)}</TableCell>
+                          </TableRow>
+                        </>
+                      );
+                    })()}
+                  </TableBody>
+                </Table>
               </div>
               <Button
-                onClick={() =>
-                  exportData(
-                    getShopTransactions(selectedShopForHistory.id),
-                    `${selectedShopForHistory.name}_transactions`,
-                  )
-                }
+                onClick={() => {
+                  const printContent = document.getElementById('printableShopDetails')?.innerHTML;
+                  const printWindow = window.open('', '', 'height=500,width=800');
+                  if (printWindow) {
+                    printWindow.document.write(`
+                      <html>
+                        <head>
+                          <title>${selectedShopForHistory.name} - Details</title>
+                          <style>
+                            body { font-family: Arial, sans-serif; padding: 20px; }
+                            table { 
+                              width: 100%; 
+                              border-collapse: collapse; 
+                              margin-bottom: 20px;
+                            }
+                            th, td { 
+                              border: 1px solid black; 
+                              padding: 8px; 
+                              text-align: left; 
+                            }
+                            th { 
+                              background-color: #f0f0f0; 
+                              font-weight: bold;
+                            }
+                            .shop-details {
+                              margin-bottom: 20px;
+                            }
+                            .shop-details div {
+                              margin-bottom: 8px;
+                            }
+                            .label {
+                              font-weight: bold;
+                              margin-right: 8px;
+                            }
+                            @media print {
+                              button { display: none; }
+                              @page { margin: 2cm; }
+                            }
+                          </style>
+                        </head>
+                        <body>
+                          ${printContent}
+                        </body>
+                      </html>
+                    `);
+                    printWindow.document.close();
+                    printWindow.focus();
+                    printWindow.print();
+                    printWindow.close();
+                  }
+                }}
               >
                 <Download className="mr-2 h-4 w-4" />
-                Export Data
+                Print Details
               </Button>
             </div>
           </DialogContent>
